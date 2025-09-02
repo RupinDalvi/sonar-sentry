@@ -5,6 +5,14 @@ const canvas = document.getElementById('visualizer');
 const canvasCtx = canvas.getContext('2d');
 const chirpPlayer = document.getElementById('chirp-player');
 
+// --- TUNING VARIABLES ---
+// Lower this to make the app more sensitive to small frequency shifts.
+const MOTION_THRESHOLD_HZ = 25; 
+// The echo must be louder than this dB value to be considered valid. Helps filter out noise.
+const PEAK_MAGNITUDE_THRESHOLD_DB = -60; 
+// How often the chirp is emitted in milliseconds.
+const PING_INTERVAL_MS = 400;
+
 // Audio and Sonar State
 let audioContext;
 let analyser;
@@ -16,7 +24,6 @@ let isSonarActive = false;
 let baselineFrequency = 0;
 const CHIRP_START_HZ = 15000;
 const CHIRP_END_HZ = 18000;
-const MOTION_THRESHOLD_HZ = 35; // Sensitivity for motion detection
 
 // --- Main Control ---
 sonarButton.addEventListener('click', () => {
@@ -30,15 +37,12 @@ sonarButton.addEventListener('click', () => {
 // --- Sonar Functions ---
 
 async function startSonar() {
-    // Initialize the Audio Context and generate the chirp sound
     if (!audioContext) {
         audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        // Generate the chirp as a playable audio source
         const chirpURL = generateChirpWAV();
         chirpPlayer.src = chirpURL;
     }
     
-    // Resume audio context if it was suspended
     if (audioContext.state === 'suspended') {
         await audioContext.resume();
     }
@@ -59,7 +63,7 @@ async function startSonar() {
         
         setTimeout(() => {
             calibrate().then(() => {
-                pingInterval = setInterval(playChirp, 500);
+                pingInterval = setInterval(playChirp, PING_INTERVAL_MS);
                 updateUI(true, "Active");
             });
         }, 500);
@@ -99,9 +103,16 @@ function analyseAudio() {
     
     const peak = findPeakFrequency(frequencyData);
 
+    // Only run Doppler check if calibration is complete
     if (baselineFrequency > 0) {
         const dopplerShift = peak.frequency - baselineFrequency;
-        if (Math.abs(dopplerShift) > MOTION_THRESHOLD_HZ && peak.magnitude > -50) {
+
+        // --- DEBUGGING LOG ---
+        // Open your browser's developer console (F12) to see this output.
+        console.log(`Peak Mag: ${peak.magnitude.toFixed(1)} dB, Freq: ${peak.frequency.toFixed(1)} Hz, Shift: ${dopplerShift.toFixed(1)} Hz`);
+
+        // Check if the echo is loud enough AND the shift is significant
+        if (peak.magnitude > PEAK_MAGNITUDE_THRESHOLD_DB && Math.abs(dopplerShift) > MOTION_THRESHOLD_HZ) {
             const direction = dopplerShift > 0 ? "Approaching" : "Receding";
             updateUI(true, `Motion Detected - ${direction}!`);
         } else {
@@ -153,12 +164,13 @@ function visualize(frequencyData) {
     canvasCtx.fillStyle = 'rgba(0, 255, 127, 0.5)';
     const barWidth = canvas.width / range;
     for (let i = 0; i < range; i++) {
-        const barHeight = (frequencyData[startIndex + i] + 100) * 2;
+        const barHeight = (frequencyData[startIndex + i] + 100) * 2; // Normalize dB for visualization
         canvasCtx.fillRect(i * barWidth, canvas.height - barHeight, barWidth, barHeight);
     }
 }
 
-// --- WAV File Generation ---
+
+// --- WAV File Generation (Unchanged) ---
 // This function creates a WAV file in memory to ensure reliable playback
 function generateChirpWAV() {
     const duration = 0.05;
@@ -170,7 +182,6 @@ function generateChirpWAV() {
     const initialFreq = CHIRP_START_HZ;
     const finalFreq = CHIRP_END_HZ;
     
-    // Create the chirp waveform
     for (let i = 0; i < numFrames; i++) {
         const time = i / sampleRate;
         const freq = initialFreq + (finalFreq - initialFreq) * (time / duration);
@@ -178,17 +189,14 @@ function generateChirpWAV() {
         channelData[i] = Math.sin(phase);
     }
 
-    // Apply a fade in/out envelope
     for (let i = 0; i < sampleRate * 0.01; i++) {
         channelData[i] *= (i / (sampleRate * 0.01));
         channelData[numFrames - 1 - i] *= (i / (sampleRate * 0.01));
     }
 
-    // Convert the buffer to a WAV file data URL
     return bufferToWave(audioBuffer, numFrames);
 }
 
-// Helper function to convert an AudioBuffer to a WAV Data URL
 function bufferToWave(abuffer, len) {
     let numOfChan = abuffer.numberOfChannels,
         length = len * numOfChan * 2 + 44,
@@ -199,20 +207,18 @@ function bufferToWave(abuffer, len) {
         pos = 0;
 
     setUint32(0x46464952); // "RIFF"
-    setUint32(length - 8); // file length - 8
+    setUint32(length - 8); 
     setUint32(0x45564157); // "WAVE"
-
-    setUint32(0x20746d66); // "fmt " chunk
-    setUint32(16); // length = 16
-    setUint16(1); // PCM (uncompressed)
+    setUint32(0x20746d66); // "fmt "
+    setUint32(16);
+    setUint16(1); 
     setUint16(numOfChan);
     setUint32(abuffer.sampleRate);
-    setUint32(abuffer.sampleRate * 2 * numOfChan); // avg. bytes/sec
-    setUint16(numOfChan * 2); // block-align
-    setUint16(16); // 16-bit
-    
-    setUint32(0x61746164); // "data" - chunk
-    setUint32(length - pos - 4); // chunk length
+    setUint32(abuffer.sampleRate * 2 * numOfChan);
+    setUint16(numOfChan * 2);
+    setUint16(16);
+    setUint32(0x61746164); // "data"
+    setUint32(length - pos - 4);
 
     for (i = 0; i < abuffer.numberOfChannels; i++)
         channels.push(abuffer.getChannelData(i));
@@ -229,13 +235,6 @@ function bufferToWave(abuffer, len) {
 
     return "data:audio/wav;base64," + btoa(String.fromCharCode.apply(null, new Uint8Array(buffer)));
 
-    function setUint16(data) {
-        view.setUint16(pos, data, true);
-        pos += 2;
-    }
-
-    function setUint32(data) {
-        view.setUint32(pos, data, true);
-        pos += 4;
-    }
+    function setUint16(data) { view.setUint16(pos, data, true); pos += 2; }
+    function setUint32(data) { view.setUint32(pos, data, true); pos += 4; }
 }
