@@ -6,32 +6,25 @@ const canvasCtx = canvas.getContext('2d');
 const chirpPlayer = document.getElementById('chirp-player');
 
 // --- TUNING VARIABLES ---
-// We can be a bit stricter now that we're filtering by magnitude.
-const MOTION_THRESHOLD_HZ = 30; 
-// *** CRITICAL ***: The echo must be louder than this to be considered valid.
-// Start at -60. If you get no detections, try -65 or -70.
-// --- TUNING VARIABLES ---
-// We've lowered the frequency, so we must also lower the Doppler threshold.
 const MOTION_THRESHOLD_HZ = 10; 
-// A good starting point for the louder echo we expect.
-const PEAK_MAGNITUDE_THRESHOLD_DB = -50; 
-const PING_INTERVAL_MS = 400;
+const PEAK_MAGNITUDE_THRESHOLD_DB = -55; // Slightly more forgiving for laptops
+const PING_INTERVAL_MS = 400; 
+const CHIRP_DURATION_S = 0.1; // Longer chirp for a stronger echo
 
 // --- NEW FREQUENCY RANGE ---
-// This is the key change. We are moving into a range the hardware handles well.
-const CHIRP_START_HZ = 2000; // 2kHz
-const CHIRP_END_HZ = 5000;   // 5kHz
+const CHIRP_START_HZ = 2000;
+const CHIRP_END_HZ = 5000;
 
 // Audio and Sonar State
 let audioContext;
 let analyser;
 let source;
 let pingInterval;
-let analysisFrame;
+let analysisInterval; // Separate interval for analysis
+let visualizerFrame;
 
 let isSonarActive = false;
 let baselineFrequency = 0;
-
 
 // --- Main Control ---
 sonarButton.addEventListener('click', () => {
@@ -46,9 +39,8 @@ sonarButton.addEventListener('click', () => {
 
 async function startSonar() {
     if (!audioContext) {
-        audioContext = new (window.AudioContext || window.webkitAudio-Context)();
-        // Generate a LOUDER chirp audio source
-        const chirpURL = generateChirpWAV(0.8); // Pass in a gain value (0.0 to 1.0)
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        const chirpURL = generateChirpWAV(0.8);
         chirpPlayer.src = chirpURL;
     }
     
@@ -58,7 +50,6 @@ async function startSonar() {
 
     try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: {
-            // These settings can help reduce automatic adjustments by the browser
             echoCancellation: false,
             autoGainControl: false,
             noiseSuppression: false
@@ -73,15 +64,18 @@ async function startSonar() {
         isSonarActive = true;
         updateUI(true, "Calibrating...");
 
-        analyseAudio();
+        // Start the VISUALIZER loop only. The analysis loop will start after calibration.
+        visualize();
         
         setTimeout(() => {
             calibrate().then((success) => {
                 if (success) {
                     pingInterval = setInterval(playChirp, PING_INTERVAL_MS);
+                    // Start the separate, slower ANALYSIS loop.
+                    analysisInterval = setInterval(runDopplerAnalysis, 100); // Analyze 10 times/sec
                     updateUI(true, "Active");
                 } else {
-                    alert("Calibration failed. No clear echo detected. Try moving closer to a reflective surface.");
+                    alert("Calibration failed. No clear echo detected. Try a different room or get closer to a wall.");
                     stopSonar();
                 }
             });
@@ -96,9 +90,10 @@ async function startSonar() {
 function stopSonar() {
     isSonarActive = false;
     clearInterval(pingInterval);
-    cancelAnimationFrame(analysisFrame);
+    clearInterval(analysisInterval); // Stop the analysis interval
+    cancelAnimationFrame(visualizerFrame);
     if (source) source.disconnect();
-    if (audioContext) audioContext.suspend(); // Suspend context to save power
+    if (audioContext) audioContext.suspend();
     updateUI(false, "Idle");
 }
 
@@ -112,34 +107,28 @@ function updateUI(isActive, statusText) {
 // --- Audio Generation & Analysis ---
 
 function playChirp() {
-    chirpPlayer.currentTime = 0; // Rewind to start before playing
+    chirpPlayer.currentTime = 0;
     chirpPlayer.play().catch(e => console.error("Audio playback failed:", e));
 }
 
-function analyseAudio() {
-    if (!isSonarActive) return;
+// NEW: This is the dedicated, high-load analysis function
+function runDopplerAnalysis() {
+    if (!isSonarActive || !baselineFrequency) return;
 
     const frequencyData = new Float32Array(analyser.frequencyBinCount);
     analyser.getFloatFrequencyData(frequencyData);
     
     const peak = findPeakFrequency(frequencyData);
+    const dopplerShift = peak.frequency - baselineFrequency;
 
-    if (baselineFrequency > 0) {
-        const dopplerShift = peak.frequency - baselineFrequency;
+    console.log(`Peak Mag: ${peak.magnitude.toFixed(1)} dB, Freq: ${peak.frequency.toFixed(1)} Hz, Shift: ${dopplerShift.toFixed(1)} Hz`);
 
-        console.log(`Peak Mag: ${peak.magnitude.toFixed(1)} dB, Freq: ${peak.frequency.toFixed(1)} Hz, Shift: ${dopplerShift.toFixed(1)} Hz`);
-
-        // Check if the echo is loud enough AND the shift is significant
-        if (peak.magnitude > PEAK_MAGNITUDE_THRESHOLD_DB && Math.abs(dopplerShift) > MOTION_THRESHOLD_HZ) {
-            const direction = dopplerShift > 0 ? "Approaching" : "Receding";
-            updateUI(true, `Motion Detected - ${direction}!`);
-        } else {
-            updateUI(true, "Active");
-        }
+    if (peak.magnitude > PEAK_MAGNITUDE_THRESHOLD_DB && Math.abs(dopplerShift) > MOTION_THRESHOLD_HZ) {
+        const direction = dopplerShift > 0 ? "Approaching" : "Receding";
+        updateUI(true, `Motion Detected - ${direction}!`);
+    } else {
+        updateUI(true, "Active");
     }
-    
-    visualize(frequencyData);
-    analysisFrame = requestAnimationFrame(analyseAudio);
 }
 
 function findPeakFrequency(data) {
@@ -161,22 +150,23 @@ function findPeakFrequency(data) {
 
 async function calibrate() {
     let validReadings = [];
-    const calibrationCycles = 10; // More cycles for better averaging
+    const calibrationCycles = 10;
     updateUI(true, "Calibrating... Do not move.");
 
     for (let i = 0; i < calibrationCycles; i++) {
         playChirp();
-        await new Promise(resolve => setTimeout(resolve, 150));
+        // Wait longer to account for the longer chirp and echo return time
+        await new Promise(resolve => setTimeout(resolve, 200)); 
         const frequencyData = new Float32Array(analyser.frequencyBinCount);
         analyser.getFloatFrequencyData(frequencyData);
         const peak = findPeakFrequency(frequencyData);
-        // Only accept the reading if it's loud enough to be a real echo
+        
         if (peak.magnitude > PEAK_MAGNITUDE_THRESHOLD_DB) {
             validReadings.push(peak.frequency);
         }
     }
 
-    if (validReadings.length > calibrationCycles / 2) { // Require at least half the readings to be valid
+    if (validReadings.length >= 3) { // Be more lenient with valid readings
         baselineFrequency = validReadings.reduce((a, b) => a + b, 0) / validReadings.length;
         console.log(`Calibration successful. Baseline frequency: ${baselineFrequency.toFixed(2)} Hz`);
         return true;
@@ -186,23 +176,34 @@ async function calibrate() {
     }
 }
 
-function visualize(frequencyData) {
+// NEW: This loop is ONLY for drawing, ensuring the UI is never blocked.
+function visualize() {
+    const frequencyData = new Float32Array(analyser.frequencyBinCount);
+    analyser.getFloatFrequencyData(frequencyData);
+    
     const binWidth = audioContext.sampleRate / analyser.fftSize;
     const startIndex = Math.floor(CHIRP_START_HZ / binWidth);
     const endIndex = Math.ceil(CHIRP_END_HZ / binWidth);
     const range = endIndex - startIndex;
+    
     canvasCtx.clearRect(0, 0, canvas.width, canvas.height);
     canvasCtx.fillStyle = 'rgba(0, 255, 127, 0.5)';
     const barWidth = canvas.width / range;
+
     for (let i = 0; i < range; i++) {
-        const barHeight = Math.max(0, (frequencyData[startIndex + i] - PEAK_MAGNITUDE_THRESHOLD_DB) * 4); // Scale relative to threshold
+        const barHeight = Math.max(0, (frequencyData[startIndex + i] - PEAK_MAGNITUDE_THRESHOLD_DB) * 4);
         canvasCtx.fillRect(i * barWidth, canvas.height - barHeight, barWidth, barHeight);
+    }
+    
+    // Keep the animation loop running as long as the sonar is active
+    if (isSonarActive) {
+        visualizerFrame = requestAnimationFrame(visualize);
     }
 }
 
-// --- WAV File Generation (Now with gain control) ---
-function generateChirpWAV(gain = 0.5) { // Default gain is 50%
-    const duration = 0.05;
+// --- WAV File Generation (Now with longer duration) ---
+function generateChirpWAV(gain = 0.8) {
+    const duration = CHIRP_DURATION_S;
     const sampleRate = audioContext.sampleRate;
     const numFrames = duration * sampleRate;
     const audioBuffer = audioContext.createBuffer(1, numFrames, sampleRate);
@@ -212,10 +213,10 @@ function generateChirpWAV(gain = 0.5) { // Default gain is 50%
         const time = i / sampleRate;
         const freq = CHIRP_START_HZ + (CHIRP_END_HZ - CHIRP_START_HZ) * (time / duration);
         const phase = 2 * Math.PI * (CHIRP_START_HZ * time + (CHIRP_END_HZ - CHIRP_START_HZ) * time * time / (2 * duration));
-        channelData[i] = Math.sin(phase) * gain; // Apply gain here
+        channelData[i] = Math.sin(phase) * gain;
     }
 
-    // Apply a fade in/out envelope to prevent clicking
+    // Apply a fade in/out envelope
     for (let i = 0; i < sampleRate * 0.01; i++) {
         channelData[i] *= (i / (sampleRate * 0.01));
         channelData[numFrames - 1 - i] *= (i / (sampleRate * 0.01));
@@ -225,6 +226,7 @@ function generateChirpWAV(gain = 0.5) { // Default gain is 50%
 }
 
 function bufferToWave(abuffer, len) {
+    // This function is unchanged and remains the same as the previous version.
     let numOfChan = abuffer.numberOfChannels,
         length = len * numOfChan * 2 + 44,
         buffer = new ArrayBuffer(length),
@@ -233,22 +235,13 @@ function bufferToWave(abuffer, len) {
         offset = 0,
         pos = 0;
 
-    setUint32(0x46464952); // "RIFF"
-    setUint32(length - 8); 
-    setUint32(0x45564157); // "WAVE"
-    setUint32(0x20746d66); // "fmt "
-    setUint32(16);
-    setUint16(1); 
-    setUint16(numOfChan);
-    setUint32(abuffer.sampleRate);
-    setUint32(abuffer.sampleRate * 2 * numOfChan);
-    setUint16(numOfChan * 2);
-    setUint16(16);
-    setUint32(0x61746164); // "data"
+    setUint32(0x46464952); setUint32(length - 8); setUint32(0x45564157);
+    setUint32(0x20746d66); setUint32(16); setUint16(1); setUint16(numOfChan);
+    setUint32(abuffer.sampleRate); setUint32(abuffer.sampleRate * 2 * numOfChan);
+    setUint16(numOfChan * 2); setUint16(16); setUint32(0x61746164);
     setUint32(length - pos - 4);
 
-    for (i = 0; i < abuffer.numberOfChannels; i++)
-        channels.push(abuffer.getChannelData(i));
+    for (i = 0; i < abuffer.numberOfChannels; i++) channels.push(abuffer.getChannelData(i));
 
     while (pos < length) {
         for (i = 0; i < numOfChan; i++) {
