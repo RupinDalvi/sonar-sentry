@@ -10,8 +10,17 @@ const chirpPlayer = document.getElementById('chirp-player');
 const MOTION_THRESHOLD_HZ = 30; 
 // *** CRITICAL ***: The echo must be louder than this to be considered valid.
 // Start at -60. If you get no detections, try -65 or -70.
-const PEAK_MAGNITUDE_THRESHOLD_DB = -60; 
+// --- TUNING VARIABLES ---
+// We've lowered the frequency, so we must also lower the Doppler threshold.
+const MOTION_THRESHOLD_HZ = 10; 
+// A good starting point for the louder echo we expect.
+const PEAK_MAGNITUDE_THRESHOLD_DB = -50; 
 const PING_INTERVAL_MS = 400;
+
+// --- NEW FREQUENCY RANGE ---
+// This is the key change. We are moving into a range the hardware handles well.
+const CHIRP_START_HZ = 2000; // 2kHz
+const CHIRP_END_HZ = 5000;   // 5kHz
 
 // Audio and Sonar State
 let audioContext;
@@ -22,8 +31,7 @@ let analysisFrame;
 
 let isSonarActive = false;
 let baselineFrequency = 0;
-const CHIRP_START_HZ = 15000;
-const CHIRP_END_HZ = 18000;
+
 
 // --- Main Control ---
 sonarButton.addEventListener('click', () => {
